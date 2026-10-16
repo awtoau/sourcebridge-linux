@@ -55,14 +55,22 @@ DB = REPO / "rulesdb" / "patterns.db"
 C2RUST_FORK = Path(os.environ.get(
     "C2RUST_FORK_DIR", "/mnt/2tb/git/github.com/awtoau/c2rust"))
 C2RUST = os.environ.get("C2RUST_BIN", str(C2RUST_FORK / "target" / "release" / "c2rust"))
-# awtoau/c2rust's kernel-idiom rewrites (WARN_ON -> kernel::warn_on!,
-# fls-family -> leading_zeros()/trailing_zeros() arithmetic) are opt-in so
-# that stock `c2rust transpile` with no flags stays byte-for-byte identical
-# to upstream immunant/c2rust. linux-rs's own baseline wants every rewrite
-# this build of c2rust knows about, so it opts in explicitly rather than
-# naming each rule (which would need updating here every time a new rule
-# is added upstream).
-C2RUST_ENABLE_RULE_ARGS = ["--enable-rule=all"]
+# These kernel-idiom rewrites are valid for every translation unit in this
+# corpus. Keep the list explicit: `--enable-rule=all` would also enable rules
+# whose validity depends on a translation unit's compiler flags.
+C2RUST_BASE_RULE_ARGS = [
+    "--enable-rule=warn-on,fls-family,swap-mem-swap,addr-label-placeholder,"
+    "export-symbol,riscv-has-extension-fallback,"
+    "refcount-overflow-detection-wrapping,va-list-builtin"
+]
+
+
+def c2rust_rule_args(command):
+    """Return c2rust rules justified by one compile_commands entry."""
+    args = list(C2RUST_BASE_RULE_ARGS)
+    if "-fno-strict-overflow" in command.split():
+        args.append("--enable-rule=signed-integer-wrapping")
+    return args
 
 # How many of the most recent distinct c2rust_rev runs to check for
 # outcome stability — see stable_files() below. 3 balances "confident
@@ -626,6 +634,7 @@ def run_one(entry, pch_flags=None):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
 
+    rule_args = c2rust_rule_args(entry["command"])
     command = use_pch_if_eligible(entry["command"], pch_flags)
     used_pch = command != entry["command"]
     entry = dict(entry, command=command)
@@ -636,7 +645,7 @@ def run_one(entry, pch_flags=None):
     start = time.monotonic()
     proc = subprocess.Popen(
         [C2RUST, "transpile", str(cc_path), "-o", str(work / "output"), "--overwrite-existing",
-         *C2RUST_ENABLE_RULE_ARGS],
+         *rule_args],
         cwd=TREE,
         preexec_fn=_limit_memory,
         stdout=subprocess.PIPE,
@@ -769,7 +778,9 @@ def make_batches(entries, pch_flags, batch_size=DEFAULT_BATCH_SIZE):
     already encodes whether -include-pch is valid for it — see
     command_matches_pch — so mixing eligible/ineligible files in one
     batch would be fine for correctness, but keeping the split makes
-    each batch homogeneous and easier to reason about/debug), then
+    each batch homogeneous and easier to reason about/debug). It also splits
+    by c2rust rule arguments, since signed wrapping is valid only for entries
+    compiled with `-fno-strict-overflow`. Then, within each group,
     within each eligibility group, further split so that no single
     batch contains two files with the same basename.
 
@@ -791,10 +802,11 @@ def make_batches(entries, pch_flags, batch_size=DEFAULT_BATCH_SIZE):
     particular duplicates apart into different batches, at most a few
     extra small batches out of the whole run.
     """
-    eligible, ineligible = [], []
+    groups = {}
     for e in entries:
         is_eligible = pch_flags is not None and command_matches_pch(e["command"], pch_flags)
-        (eligible if is_eligible else ineligible).append(e)
+        key = (is_eligible, tuple(c2rust_rule_args(e["command"])))
+        groups.setdefault(key, []).append(e)
 
     def chunk_by_unique_basename(group):
         chunks = []
@@ -813,7 +825,10 @@ def make_batches(entries, pch_flags, batch_size=DEFAULT_BATCH_SIZE):
             chunks.append(current)
         return chunks
 
-    return chunk_by_unique_basename(eligible) + chunk_by_unique_basename(ineligible)
+    batches = []
+    for group in groups.values():
+        batches.extend(chunk_by_unique_basename(group))
+    return batches
 
 
 def run_batch(entries, pch_flags=None):
@@ -835,6 +850,10 @@ def run_batch(entries, pch_flags=None):
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
 
+    rule_args = c2rust_rule_args(entries[0]["command"])
+    if any(c2rust_rule_args(entry["command"]) != rule_args for entry in entries[1:]):
+        raise ValueError("batch contains entries with different c2rust rule policies")
+
     cc_entries = []
     used_pch_by_file = {}
     for e in entries:
@@ -847,7 +866,7 @@ def run_batch(entries, pch_flags=None):
     start = time.monotonic()
     proc = subprocess.Popen(
         [C2RUST, "transpile", str(cc_path), "-o", str(work / "output"),
-         "--overwrite-existing", "--batch-json", *C2RUST_ENABLE_RULE_ARGS],
+         "--overwrite-existing", "--batch-json", *rule_args],
         cwd=TREE,
         preexec_fn=_limit_memory,
         stdout=subprocess.PIPE,
